@@ -1,0 +1,179 @@
+Siver Layer
+
+Row counts match: 22,183 rows in both source and iceberg table. Let me check data integrity with a sample and null counts.
+
+Sample 5 rows from iceberg table
+Check null counts and sample data from iceberg table
+Validation summary:
+
+Check	Result
+Row count match	22,183 (source) = 22,183 (iceberg)
+source_dataset_id	22,183 non-null
+vin	22,183 non-null
+make	22,183 non-null
+model	22,151 non-null (32 nulls — likely missing data in source)
+model_year range	1999–2023
+ingested_at	22,183 non-null
+Distinct states	19
+The iceberg table is fully populated with correct data. The 32 null model values are from the source data, not a loading issue.
+
+For reference, here's what the notebook will do:
+
+Inspect the 32 null model rows (all Volvo 2023 BEV)
+Compute mode for Volvo 2023 BEV → C40 (2 occurrences)
+Create Dynamic Table SILVER_EV_CLEANED that uses COALESCE to replace null models with the mode, computed per MAKE, MODEL_YEAR, EV_TYPE
+Validate zero null models remain and row count is 22,183
+-- Silver Layer: EV Data Cleaning
+-- Impute null MODEL values using mode grouped by MAKE, MODEL_YEAR, EV_TYPE
+-- Then create Dynamic Table SILVER_EV_CLEANED
+
+-- All 32 null model rows are VOLVO, 2023, BEV
+-- Mode for Volvo 2023 BEV = C40 (2 occurrences vs 1 for XC40)
+
+CREATE OR REPLACE DYNAMIC TABLE EV_RESEARCH.PUBLIC.SILVER_EV_CLEANED
+  TARGET_LAG = '1 hour'
+  WAREHOUSE = COMPUTE_WH
+AS
+WITH mode_lookup AS (
+    SELECT make, model_year, ev_type, model AS mode_model
+    FROM (
+        SELECT
+            make,
+            model_year,
+            ev_type,
+            model,
+            ROW_NUMBER() OVER (
+                PARTITION BY make, model_year, ev_type
+                ORDER BY COUNT(*) DESC
+            ) AS rn
+        FROM EV_RESEARCH.PUBLIC.EV_POPULATION_FINAL_3
+        WHERE model IS NOT NULL
+        GROUP BY make, model_year, ev_type, model
+    )
+    WHERE rn = 1
+)
+SELECT
+    e.source_dataset_id,
+    e.data_provider,
+    e.vin,
+    e.county,
+    e.city,
+    e.state,
+    e.model_year,
+    e.make,
+    COALESCE(e.model, m.mode_model) AS model,
+    e.ev_type,
+    e.location_point,
+    e.ingested_at
+FROM EV_RESEARCH.PUBLIC.EV_POPULATION_FINAL_3 e
+LEFT JOIN mode_lookup m
+    ON e.make = m.make
+    AND e.model_year = m.model_year
+    AND e.ev_type = m.ev_type
+    AND e.model IS NULL;
+
+Now let me update the notebook with the SQL that was executed:
+
+Completed: edit_cells
+Notebook updated. Here's the validation summary:
+
+Validation Results for SILVER_EV_CLEANED:
+
+Check	Result
+Total rows	22,183
+Null model count	0
+Volvo 2023 BEV - C40	34 (was 2 original + 32 imputed)
+Volvo 2023 BEV - XC40	1 (unchanged)
+All 32 null MODEL values were successfully imputed with C40 (the mode for Volvo 2023 BEV). Zero nulls remain.
+
+----------------
+
+Here's the null analysis:
+
+Column	Nulls	Assessment
+county	1	Single TX row missing county/city/location — likely incomplete registration data. Could look up by VIN or leave as-is.
+city	1	Same row as above (VIN 7SAYGDEE3N).
+location_point	7	6 have county/city/state but no coordinates; 1 (TX) is missing everything geographic except state.
+All other columns	0	Clean.
+Imputation strategy recommendations:
+
+county & city (1 null each) — Same record. Could impute via reverse-lookup from other rows with the same VIN prefix or state, but with only 1 row it's safer to leave as 'UNKNOWN' or investigate the source.
+
+location_point (7 nulls) — These are geographic coordinates. Options:
+
+Geocode from city/state: For the 6 rows that have city+county, derive approximate coordinates from a geocoding reference or from the mode of location_point for matching city+state combinations.
+Leave null: The TX row has no city/county, so geocoding isn't feasible without external data.
+Flag as missing: Add a location_imputed boolean column if you geocode.
+Would you like me to proceed with any of these strategies? For example, I can impute the 6 location_point values using the most common coordinates for their city+state, and set county/city to 'UNKNOWN' for the TX row.
+--------------------
+
+-- Silver Layer: EV Data Cleaning
+-- 1) Impute null MODEL using mode by MAKE, MODEL_YEAR, EV_TYPE
+-- 2) Impute null LOCATION_POINT using mode by CITY+STATE, fallback to COUNTY+STATE
+
+CREATE OR REPLACE DYNAMIC TABLE EV_RESEARCH.PUBLIC.SILVER_EV_CLEANED
+  TARGET_LAG = '1 hour'
+  WAREHOUSE = COMPUTE_WH
+AS
+WITH mode_model AS (
+    SELECT make, model_year, ev_type, model AS mode_model
+    FROM (
+        SELECT make, model_year, ev_type, model,
+            ROW_NUMBER() OVER (PARTITION BY make, model_year, ev_type ORDER BY COUNT(*) DESC) AS rn
+        FROM EV_RESEARCH.PUBLIC.EV_POPULATION_FINAL_3
+        WHERE model IS NOT NULL
+        GROUP BY make, model_year, ev_type, model
+    )
+    WHERE rn = 1
+),
+mode_loc_city AS (
+    SELECT city, state, location_point AS mode_loc
+    FROM (
+        SELECT city, state, location_point,
+            ROW_NUMBER() OVER (PARTITION BY city, state ORDER BY COUNT(*) DESC) AS rn
+        FROM EV_RESEARCH.PUBLIC.EV_POPULATION_FINAL_3
+        WHERE location_point IS NOT NULL AND city IS NOT NULL
+        GROUP BY city, state, location_point
+    )
+    WHERE rn = 1
+),
+mode_loc_county AS (
+    SELECT county, state, location_point AS mode_loc
+    FROM (
+        SELECT county, state, location_point,
+            ROW_NUMBER() OVER (PARTITION BY county, state ORDER BY COUNT(*) DESC) AS rn
+        FROM EV_RESEARCH.PUBLIC.EV_POPULATION_FINAL_3
+        WHERE location_point IS NOT NULL AND county IS NOT NULL
+        GROUP BY county, state, location_point
+    )
+    WHERE rn = 1
+)
+SELECT
+    e.source_dataset_id,
+    e.data_provider,
+    e.vin,
+    e.county,
+    e.city,
+    e.state,
+    e.model_year,
+    e.make,
+    COALESCE(e.model, mm.mode_model) AS model,
+    e.ev_type,
+    COALESCE(e.location_point, lc.mode_loc, lco.mode_loc) AS location_point,
+    e.ingested_at
+FROM EV_RESEARCH.PUBLIC.EV_POPULATION_FINAL_3 e
+LEFT JOIN mode_model mm
+    ON e.make = mm.make
+    AND e.model_year = mm.model_year
+    AND e.ev_type = mm.ev_type
+    AND e.model IS NULL
+LEFT JOIN mode_loc_city lc
+    ON e.city = lc.city
+    AND e.state = lc.state
+    AND e.location_point IS NULL
+LEFT JOIN mode_loc_county lco
+    ON e.county = lco.county
+    AND e.state = lco.state
+    AND e.location_point IS NULL;
+
+__________________

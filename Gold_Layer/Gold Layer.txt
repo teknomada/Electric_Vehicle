@@ -1,0 +1,157 @@
+Gold Layer
+
+3. Gold Layer: Business Aggregates (The "Knowledge" Layer)
+This layer is optimized for reporting and analytics. It contains highly joined tables or specific aggregates. We can use dbt to manage these transformations, as it excels at documenting business logic and running data quality tests.
+
+Snowflake Feature: dbt (for modeling) & Dynamic Tables (for real-time dashboards).
+
+Action: Create a "Fact" table that summarizes EV adoption by region or manufacturer.
+
+CREATE OR REPLACE DYNAMIC TABLE EV_RESEARCH.PUBLIC.GOLD_EV_STATE_METRICS
+  TARGET_LAG = '1 hour'
+  WAREHOUSE = COMPUTE_WH
+AS
+SELECT
+    state,
+    model_year,
+    COUNT(vin) AS total_vehicles,
+    COUNT(DISTINCT make) AS unique_makes,
+    COUNT(DISTINCT model) AS unique_models,
+    COUNT_IF(ev_type = 'Battery Electric Vehicle (BEV)') AS bev_count,
+    COUNT_IF(ev_type = 'Plug-in Hybrid Electric Vehicle (PHEV)') AS phev_count,
+    ROUND(COUNT_IF(ev_type = 'Battery Electric Vehicle (BEV)') / NULLIF(COUNT(*), 0) * 100, 2) AS bev_pct,
+    ROUND(COUNT_IF(ev_type = 'Plug-in Hybrid Electric Vehicle (PHEV)') / NULLIF(COUNT(*), 0) * 100, 2) AS phev_pct
+FROM
+    EV_RESEARCH.PUBLIC.SILVER_EV_CLEANED
+GROUP BY state, model_year
+
+---------------
+
+Validate data quality in GOLD_EV_STATE_METRICS by comparing aggregated totals against SILVER_EV_CLEANED source
+
+Spot-check per-state totals gold vs silver
+Compare total row counts gold vs silver
+Compare BEV/PHEV counts gold vs silver
+All checks pass — perfect match across every metric.
+
+Validation Check	Silver	Gold	Match
+Total vehicles	22,183	22,183	✓
+Distinct states	19	19	✓
+Distinct model years	17	17	✓
+BEV count	17,060	17,060	✓
+PHEV count	5,123	5,123	✓
+Per-state diff	—	—	All 19 states = 0 diff
+No data loss or duplication in the gold layer aggregation.
+
+-----------------
+Identify which states have the highest BEV adoption rate and lowest EV penetration in GOLD_EV_STATE_METRICS
+
+-- Highest BEV Adoption Rate by State
+SELECT
+    state,
+    SUM(total_vehicles) AS total_vehicles,
+    SUM(bev_count) AS total_bev,
+    SUM(phev_count) AS total_phev,
+    ROUND(SUM(bev_count) / NULLIF(SUM(total_vehicles), 0) * 100, 2) AS bev_adoption_rate
+FROM EV_RESEARCH.PUBLIC.GOLD_EV_STATE_METRICS
+GROUP BY state
+ORDER BY bev_adoption_rate DESC;
+
+Highest BEV Adoption Rate (among states with meaningful volume):
+
+State	Total Vehicles	BEV	BEV Rate
+WA	22,120	17,022	76.95%
+CA	14	9	64.29%
+TX	8	5	62.50%
+GA, DC, MO, IL, LA, WI show 100% but  have only 1-3 vehicles each — statistically insignificant.
+
+----------------------------------------------
+-- Lowest EV Penetration by State (total vehicle count)
+SELECT
+    state,
+    SUM(total_vehicles) AS total_vehicles,
+    SUM(bev_count) AS total_bev,
+    SUM(phev_count) AS total_phev,
+    ROUND(SUM(bev_count) / NULLIF(SUM(total_vehicles), 0) * 100, 2) AS bev_adoption_rate
+FROM EV_RESEARCH.PUBLIC.GOLD_EV_STATE_METRICS
+GROUP BY state
+ORDER BY total_vehicles ASC;
+
+
+Lowest EV Penetration (fewest total registrations):
+
+State	Total Vehicles	BEV Rate
+KS, CT, UT, AK, NY, CO	1 each	0% (all PHEV)
+LA, GA, WI, MO	1 each	100% (all BEV)
+Key insight: WA dominates with 99.7% of all registrations (22,120 of 22,183). All other states have minimal penetration (1–17 vehicles), making this primarily a Washington State dataset.
+----------------------------
+
+Analyze BEV adoption trends over model years in GOLD_EV_STATE_METRICS to identify if newer vehicles skew more electric
+-- BEV Adoption Trend by Model Year
+SELECT
+    model_year,
+    SUM(total_vehicles) AS total_vehicles,
+    SUM(bev_count) AS total_bev,
+    SUM(phev_count) AS total_phev,
+    ROUND(SUM(bev_count) / NULLIF(SUM(total_vehicles), 0) * 100, 2) AS bev_pct,
+    ROUND(SUM(phev_count) / NULLIF(SUM(total_vehicles), 0) * 100, 2) AS phev_pct
+FROM EV_RESEARCH.PUBLIC.GOLD_EV_STATE_METRICS
+GROUP BY model_year
+ORDER BY model_year;
+
+Yes, newer vehicles strongly skew toward BEV. Clear upward trend:
+
+Period	BEV %	Trend
+2012–2014	49–66%	PHEV nearly matched BEV
+2015–2017	56–74%	BEV gaining ground
+2018–2020	69–84%	BEV pulling ahead significantly
+2021–2022	81–85%	BEV dominant
+2023	92.85%	Highest — nearly all-electric
+Key findings:
+
+BEV adoption climbed from ~49% (2012) to ~93% (2023) — a 44-point increase
+PHEV share dropped from 51% (2012) to just 7% (2023)
+The inflection point was 2018–2019, when BEV jumped from 69% to 81%, likely driven by Tesla Model 3 availability
+2022 had the highest volume (4,997 vehicles) at 85% BEV
+2023 is partial-year data (1,356 vehicles) but shows the strongest BEV skew yet
+
+--------------------------
+Identify which vehicle makes and models are driving the BEV adoption trend in recent years (2022-2023)
+
+-- Top Models Driving BEV Adoption (2022-2023)
+SELECT
+    make,
+    model,
+    model_year,
+    COUNT(*) AS total,
+    ROUND(COUNT(*) / SUM(COUNT(*)) OVER () * 100, 2) AS pct_of_all_bev
+FROM EV_RESEARCH.PUBLIC.SILVER_EV_CLEANED
+WHERE model_year IN (2022, 2023)
+  AND ev_type = 'Battery Electric Vehicle (BEV)'
+GROUP BY make, model, model_year
+ORDER BY total DESC
+LIMIT 20;
+
+Top Makes (2022–2023):
+
+Make	BEV	Total	BEV %	Role
+Tesla	3,252	3,252	100%	Dominant — 59% of all BEVs
+Kia	349	451	77%	Strong BEV challenger
+Ford	302	343	88%	Mach-E driving growth
+Chevrolet	259	259	100%	Bolt EV/EUV
+Nissan	233	233	100%	Leaf legacy
+Rivian	179	179	100%	New entrant
+Top Models (2022–2023):
+
+Model	Year	Count	% of All BEV
+Tesla Model Y	2022	1,368	24.8%
+Tesla Model 3	2022	880	16.0%
+Tesla Model Y	2023	449	8.1%
+Ford Mustang Mach-E	2022	206	3.7%
+Kia EV6	2022	205	3.7%
+Key takeaways:
+
+Tesla Model Y + Model 3 account for ~52% of all 2022–2023 BEVs
+Tesla alone represents 59% of all BEV registrations in this period
+Notable PHEV holdouts: Jeep (146, 100% PHEV), BMW (63% PHEV), Toyota (97% PHEV)
+New BEV-only brands (Rivian, Polestar, Lucid) are gaining traction

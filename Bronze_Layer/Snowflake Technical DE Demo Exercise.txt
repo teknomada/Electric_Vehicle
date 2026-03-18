@@ -1,0 +1,132 @@
+Snowflake Technical DE Demo Exercise
+
+Step 1.a: Prepare the Environment
+First, we need a place for the data to live. We will create a database, a schema, and a "Landing" table with a single VARIANT column to hold the raw JSON.
+
+SQL
+-- Create the infrastructure
+CREATE DATABASE IF NOT EXISTS EV_RESEARCH;
+CREATE SCHEMA IF NOT EXISTS EV_RESEARCH.RAW;
+
+-- Step 1.b -- Create a landing table for the JSON blob
+CREATE OR REPLACE TABLE EV_RESEARCH.RAW.EV_DATA_LANDING (
+    json_raw VARIANT
+);
+
+files 
+-- Create_Infrastructure.sql
+-- Create_Landing_Table.sql
+
+-- Step 2: Create a File Format & Stage 
+We need to tell Snowflake that the file coming in is JSON. Then, we’ll create a stage (a virtual bucket) to hold the file before it's loaded.
+Step 2.a
+-- Define the JSON file format
+
+CREATE OR REPLACE FILE FORMAT my_json_format
+    TYPE = 'JSON'
+    STRIP_OUTER_ARRAY = FALSE;
+
+Step 2.b -- Create an internal stage
+
+CREATE OR REPLACE STAGE EV_RESEARCH.RAW.ev_stage
+  FILE_FORMAT = (FORMAT_NAME = 'my_json_format');
+
+Files:
+-- JSON_Format.sql
+-- Internal_Stage.sql
+
+Step 3: Upload and Copy
+Next, we  need to  upload the file to the stage. Two options:
+
+Option 1. Using the PUT command in SnowSQL
+
+--  (Execute in SnowSQL) Upload local file: 
+PUT 'file://C:/Users/User/Documents/SnowFlake/ElectricVehiclePopulationData.json' @ev_stage;
+
+Option 2. Simply clicking "Upload" in the Snowsight UI and then run the COPY INTO command.
+
+-- Load the data from the stage into our landing table
+COPY INTO EV_DATA_LANDING
+FROM @ev_stage/ElectricVehiclePopulationData.json
+ON_ERROR = 'CONTINUE';
+
+Files:
+-- Load_Data.sql
+
+Step 4: Flatten the Data 
+In the JSON file, the actual records are hidden inside the data array. Since the data field contains an array of arrays, we use Snowflake’s FLATTEN function to turn each entry into its own row.
+
+Based on the columns defined in the file's meta section, here is how to extract the actual vehicle info:
+
+CREATE OR REPLACE TABLE EV_RESEARCH.PUBLIC.EV_POPULATION_FINAL AS
+SELECT
+    value[8]::STRING  AS vin,            -- Index 8 is VIN (1-10)
+    value[9]::STRING  AS county,         -- Index 9 is County
+    value[10]::STRING AS city,           -- Index 10 is City
+    value[11]::STRING AS state,          -- Index 11 is State
+    value[13]::NUMBER AS model_year,     -- Index 13 is Model Year
+    value[14]::STRING AS make,           -- Index 14 is Make
+    value[15]::STRING AS model,          -- Index 15 is Model
+    value[16]::STRING AS ev_type         -- Index 16 is Electric Vehicle Type
+FROM 
+    EV_RESEARCH.PUBLIC.EV_DATA_LANDING,
+    LATERAL FLATTEN(input => json_raw:data);
+
+Files:
+-- Populate_Table.sql
+
+----------------------------------------------
+Including the metadata is a best practice in Snowflake architecture because it provides lineage and context for the raw data.
+
+Since the meta object is a single set of values at the top of the file and the data object is a large array, we typically handle them in two options: 
+-- Option 1. creating a separate Audit/Metadata table 
+-- Option 2. enriching every row in the final table with those details.
+
+Here is how we can extract and use that metadata:
+
+Option 1. Extracting Metadata to a Dedicated Audit Table
+This is the cleanest approach. It allows you to track where the data came from, who the provider is (attribution), and when it was last updated without repeating that info millions of times in your main data table.
+
+SQL
+-- Create a table to store the dataset's high-level properties
+CREATE OR REPLACE TABLE EV_RESEARCH.RAW.DATASET_PROPERTIES AS
+SELECT
+    json_raw:meta.view.id::STRING          AS dataset_id,
+    json_raw:meta.view.name::STRING        AS dataset_name,
+    json_raw:meta.view.attribution::STRING AS data_source,
+    -- Convert Unix timestamp (seconds) to Snowflake Timestamp
+    TO_TIMESTAMP_NTZ(json_raw:meta.view.rowsUpdatedAt::INT) AS last_updated_at,
+    json_raw:meta.view.description::STRING AS description
+FROM 
+    EV_RESEARCH.RAW.EV_DATA_LANDING;
+
+
+Option 2. Enriching the Final Table (Flattening + Metadata)
+If you want to keep the "Dataset ID" or "Source Name" attached to every vehicle record for reporting purposes, you can perform a "Cross Join" or simply reference the path in your SELECT statement while flattening the array.
+
+SQL
+CREATE OR REPLACE TABLE EV_RESEARCH.RAW.EV_POPULATION_FINAL AS
+SELECT
+    -- Metadata fields (repeated for each row)
+    json_raw:meta.view.id::STRING          AS source_dataset_id,
+    json_raw:meta.view.attribution::STRING AS data_provider,
+    
+    -- Data fields (from the array)
+    value[8]::STRING  AS vin,
+    value[9]::STRING  AS county,
+    value[10]::STRING AS city,
+    value[11]::STRING AS state,
+    value[13]::NUMBER AS model_year,
+    value[14]::STRING AS make,
+    value[15]::STRING AS model,
+    value[16]::STRING AS ev_type,
+    value[22]::STRING AS location_point  -- Extracting the "POINT (...)" string
+FROM 
+    EV_RESEARCH.RAW.EV_DATA_LANDING,
+    LATERAL FLATTEN(input => json_raw:data);
+
+
+Why do this?
+Traceability: If you ever load a second version of this file (e.g., from a different state), the data_provider column ensures you don't mix up your sources.
+
+Time-Series Tracking: By extracting rowsUpdatedAt, you can tell exactly how "fresh" your EV statistics are during your analysis.
