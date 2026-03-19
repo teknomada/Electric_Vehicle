@@ -1,0 +1,28 @@
+1. The Trigger Node (Local Watcher)
+In OpenFlow, your first step is a File Watcher node. Instead of Snowpipe waiting for a cloud notification, OpenFlow detects when your ElectricVehiclePopulationData.json is ready on your local machine or server.
+
+2. The Ingestion Node (SnowSQL Execution) 
+Once the file is detected, OpenFlow triggers a SnowSQL command. We will modify the COPY INTO logic from your text file to run as a direct command.
+The OpenFlow Command Node logic:Bash# OpenFlow executes this to move the local file to Snowflake
+
+snowsql -q "PUT file://C:/Data/EV_Data.json @json_landing_stage; 
+            COPY INTO BRONZE_RAW FROM @json_landing_stage;"
+
+3. The Transformation Layer (Dynamic Table Refresh) 
+Your traditional approach uses TARGET_LAG = '30 minutes'. In an OpenFlow pipeline, we can make this "On-Demand" to save credits. We set the Dynamic Tables to DOWNSTREAM and use OpenFlow to kick off the refresh only when the Bronze data is fresh.
+The SQL Node in OpenFlow:SQL-- Triggered by OpenFlow after the PUT/COPY succeeds
+
+ALTER DYNAMIC TABLE SILVER_EV_CLEANED REFRESH;
+ALTER DYNAMIC TABLE GOLD_EV_STATE_METRICS REFRESH;
+
+4. The Monitoring Node (Error Handling) 
+OpenFlow can monitor the INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY (which was at the end of your file). If a refresh fails, OpenFlow can send you a notification or retry the step—something traditional Dynamic Tables can't do on their own.
+
+Summary of the Shift
+FeatureTraditional Approach (from your file)OpenFlow Orchestrated ApproachIngestionSnowpipe (Auto-ingest)OpenFlow Trigger (Event-based)ScheduleTarget Lag (Always on)Manual/Scheduled Refresh (Credit efficient)LogicInternal to SnowflakeVisual Workflow in OpenFlowContextData-onlyEnd-to-end (includes local file handling)
+
+Feature,Traditional Approach (from your file),OpenFlow Orchestrated Approach
+Ingestion,Snowpipe (Auto-ingest),OpenFlow Trigger (Event-based)
+Schedule,Target Lag (Always on),Manual/Scheduled Refresh (Credit efficient)
+Logic,Internal to Snowflake,Visual Workflow in OpenFlow
+Context,Data-only,End-to-end (includes local file handling)
