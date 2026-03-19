@@ -1,0 +1,5 @@
+
+Configure an external volume for Amazon S3
+
+https://docs.snowflake.com/en/user-guide/tables-iceberg-configure-external-volume-s3
+
