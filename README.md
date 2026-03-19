@@ -36,6 +36,8 @@ Here are the results, equivalent to pandas.describe():
 - Data Lineage
 
 ## Orchestration
+- Native Snowflake setup (SnowPipe + Dynamic Tables)
+- Orchestrated Pipeline using Open Flow
 
 ## Open Table Formats
 - Iceberg Table in AWS S3 (parquet fromat) for open table interoperability
