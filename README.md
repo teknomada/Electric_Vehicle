@@ -10,10 +10,15 @@ Technical DE Demo Exercise
 7. Build a Streamlit app to respond queries submitted in Natural Language
 
 ## Analyze the dataset
+- SQL-Describe()
+Here are the results, equivalent to pandas.describe():
+1. Numeric column stats (count, mean, std, min, percentiles, max):
+2. Categorical column stats (count, unique, top, freq):
+
 
 ## Implement Medallion Architecture 
 ### Bronze Layer 
-- Ingest the data (json file ) and tore raw data
+- Ingest the data (json file ) and store raw data
 - Create Snow flake table 
 
 
