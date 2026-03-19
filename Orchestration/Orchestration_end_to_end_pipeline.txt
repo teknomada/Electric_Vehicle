@@ -1,0 +1,96 @@
+Here's a complete automated medallion pipeline using Snowpipe + Dynamic Tables:
+
+Architecture Overview
+text
+JSON files → [Snowpipe] → Bronze (raw) → [Dynamic Table] → Silver (cleaned) → [Dynamic Table] → Gold (aggregated)
+Step 1: Setup
+sql
+USE ROLE SYSADMIN;
+CREATE DATABASE IF NOT EXISTS EV_RESEARCH;
+CREATE SCHEMA IF NOT EXISTS EV_RESEARCH.PUBLIC;
+USE WAREHOUSE COMPUTE_WH;
+Step 2: Bronze Layer — Ingest Raw JSON
+sql
+-- Landing table for raw JSON
+CREATE OR REPLACE TABLE EV_RESEARCH.PUBLIC.BRONZE_RAW (
+    raw_content   VARIANT,
+    filename      VARCHAR DEFAULT METADATA$FILENAME,
+    ingested_at   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Stage for incoming JSON files
+CREATE OR REPLACE STAGE EV_RESEARCH.PUBLIC.json_landing_stage
+    FILE_FORMAT = (TYPE = 'JSON' STRIP_OUTER_ARRAY = TRUE);
+
+-- Snowpipe for automatic ingestion
+CREATE OR REPLACE PIPE EV_RESEARCH.PUBLIC.bronze_pipe
+    AUTO_INGEST = TRUE
+    AS
+    COPY INTO EV_RESEARCH.PUBLIC.BRONZE_RAW (raw_content)
+    FROM @EV_RESEARCH.PUBLIC.json_landing_stage;
+For auto-ingest, configure cloud event notifications (S3 SQS, Azure Event Grid, or GCS Pub/Sub) on your stage bucket.
+
+Step 3: Silver Layer — Cleanse & Flatten (Dynamic Table)
+sql
+CREATE OR REPLACE DYNAMIC TABLE EV_RESEARCH.PUBLIC.SILVER_EV_CLEANED
+    TARGET_LAG = DOWNSTREAM
+    WAREHOUSE = COMPUTE_WH
+    REFRESH_MODE = INCREMENTAL
+AS
+SELECT
+    raw_content:"VIN (1-10)"::STRING            AS vin,
+    raw_content:"County"::STRING                 AS county,
+    raw_content:"City"::STRING                   AS city,
+    raw_content:"State"::STRING                  AS state,
+    raw_content:"Model Year"::NUMBER             AS model_year,
+    raw_content:"Make"::STRING                   AS make,
+    raw_content:"Model"::STRING                  AS model,
+    raw_content:"Electric Vehicle Type"::STRING   AS ev_type,
+    raw_content:"Vehicle Location"::STRING        AS location_point,
+    filename,
+    ingested_at
+FROM EV_RESEARCH.PUBLIC.BRONZE_RAW
+WHERE raw_content:"VIN (1-10)" IS NOT NULL;
+Step 4: Gold Layer — Business Aggregations (Dynamic Table)
+sql
+CREATE OR REPLACE DYNAMIC TABLE EV_RESEARCH.PUBLIC.GOLD_EV_STATE_METRICS
+    TARGET_LAG = '30 minutes'   -- drives the entire pipeline refresh
+    WAREHOUSE = COMPUTE_WH
+    REFRESH_MODE = INCREMENTAL
+AS
+SELECT
+    state,
+    county,
+    model_year,
+    COUNT(*)                                                          AS total_evs,
+    COUNT_IF(ev_type = 'Battery Electric Vehicle (BEV)')              AS bev_count,
+    COUNT_IF(ev_type = 'Plug-in Hybrid Electric Vehicle (PHEV)')      AS phev_count,
+    ROUND(bev_count * 100.0 / NULLIF(total_evs, 0), 2)               AS bev_pct,
+    COUNT(DISTINCT make)                                               AS unique_makes,
+    MODE(make)                                                         AS top_make
+FROM EV_RESEARCH.PUBLIC.SILVER_EV_CLEANED
+GROUP BY state, county, model_year;
+How It Works
+Layer	Object	Refresh Trigger
+Bronze	BRONZE_RAW table	Snowpipe auto-loads new JSON files on arrival
+Silver	SILVER_EV_CLEANED dynamic table	DOWNSTREAM — refreshes when Gold needs it
+Gold	GOLD_EV_STATE_METRICS dynamic table	Every 30 minutes (drives the entire DAG)
+The Gold layer's TARGET_LAG = '30 minutes' controls the entire pipeline cadence. When it triggers, Snowflake automatically refreshes Silver first (because it's set to DOWNSTREAM), ensuring consistent snapshots across all layers.
+
+Step 5: Monitor the Pipeline
+sql
+-- Check refresh history
+SELECT name, refresh_action, state, state_message,
+       refresh_trigger, refresh_start_time, refresh_end_time
+FROM TABLE(INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY())
+ORDER BY refresh_start_time DESC
+LIMIT 20;
+
+-- Check dynamic table graph & lag
+SHOW DYNAMIC TABLES IN SCHEMA EV_RESEARCH.PUBLIC;
+Key benefits over streams + tasks:
+
+Declarative — define what data looks like, not how to transform it
+Auto-orchestrated — Snowflake manages scheduling, dependencies, and snapshot isolation
+Incremental — only processes changed data when possible
+Adjust freshness with a single ALTER DYNAMIC TABLE ... SET TARGET_LAG command
